@@ -1,0 +1,56 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{PROJECT_DIR}}/hooks/userpromptsubmit_hook.py",
+            "timeout": 5000,
+            "description": "LLM Vault - Prevent credential leaks in prompts"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{PROJECT_DIR}}/hooks/pretooluse_hook.py",
+            "timeout": 5000,
+            "description": "LLM Vault - Inject cached credentials into commands"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{PROJECT_DIR}}/hooks/posttoolusefailure_hook.py",
+            "timeout": 5000,
+            "description": "LLM Vault - Detect credential-related errors"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{PROJECT_DIR}}/hooks/stop_hook.py",
+            "timeout": 10000,
+            "description": "LLM Vault - Detect when Claude requests credentials"
+          }
+        ]
+      }
+    ]
+  }
+}
