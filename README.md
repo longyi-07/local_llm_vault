@@ -28,7 +28,7 @@ If a credential value accidentally appears in command output, Claude is warned n
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USER/local_llm_vault.git
+git clone https://github.com/longyi-07/local_llm_vault.git
 cd local_llm_vault
 ./install.sh
 ```
