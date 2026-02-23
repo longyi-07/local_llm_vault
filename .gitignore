@@ -1,52 +1,41 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
+.venv/
 venv/
-ENV/
-env/
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Credentials (DO NOT COMMIT)
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+
+# Credentials & secrets (NEVER commit)
 *.meta.json
-/tmp/llm-vault-session-*.json
 credentials.json
 secrets.json
 .env
 .env.local
 
-# Logs
+# LLM Vault runtime (installed to ~/.llm-vault/, not in repo)
 *.log
 
-# Testing
+# Testing artifacts
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Claude local settings (user-specific, not shared)
+.claude/settings.local.json

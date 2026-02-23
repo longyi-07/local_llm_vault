@@ -1,93 +1,148 @@
 #!/bin/bash
-# LLM Vault - Installation Script
-# Installs hooks into Claude Code configuration
+set -euo pipefail
 
-set -e
+# LLM Vault installer
+# Copies hooks to ~/.llm-vault/hooks/ and merges config into ~/.claude/settings.json
 
-echo "🔐 LLM Vault - Installation"
-echo "================================"
+VAULT_DIR="$HOME/.llm-vault"
+HOOKS_DIR="$VAULT_DIR/hooks"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_HOOKS="$SCRIPT_DIR/.claude/hooks"
+
+echo "🔐 LLM Vault — Installing..."
 echo ""
 
-# Get the absolute path to this script's directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# 1. Create directories
+mkdir -p "$HOOKS_DIR"
+mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
 
-# Claude Code settings directory
-CLAUDE_SETTINGS_DIR="$HOME/.config/claude"
-CLAUDE_SETTINGS_FILE="$CLAUDE_SETTINGS_DIR/settings.json"
+# 2. Copy hook scripts
+echo "  Copying hooks to $HOOKS_DIR/"
+cp "$SOURCE_HOOKS/block_secrets.py"  "$HOOKS_DIR/"
+cp "$SOURCE_HOOKS/check_leaks.py"    "$HOOKS_DIR/"
+cp "$SOURCE_HOOKS/session_start.py"  "$HOOKS_DIR/"
+cp "$SOURCE_HOOKS/vault.py"          "$HOOKS_DIR/"
+cp "$SOURCE_HOOKS/vault"             "$HOOKS_DIR/"
+chmod +x "$HOOKS_DIR"/*.py "$HOOKS_DIR/vault"
 
-# Make hooks executable
-echo "📝 Making hooks executable..."
-chmod +x "$SCRIPT_DIR/hooks"/*.py
-chmod +x "$SCRIPT_DIR/lib"/*.py
+# Add vault CLI to PATH via symlink
+mkdir -p "$HOME/.local/bin"
+ln -sf "$HOOKS_DIR/vault" "$HOME/.local/bin/vault"
+echo "  ✓ 4 hooks + vault CLI installed"
 
-# Create Claude settings directory if it doesn't exist
-if [ ! -d "$CLAUDE_SETTINGS_DIR" ]; then
-    echo "📁 Creating Claude settings directory..."
-    mkdir -p "$CLAUDE_SETTINGS_DIR"
+# 3. Initialize credential registry if it doesn't exist
+if [ ! -f "$VAULT_DIR/keys.json" ]; then
+    echo '[]' > "$VAULT_DIR/keys.json"
+    echo "  ✓ Credential registry created"
 fi
 
-# Check if settings.json exists
-if [ -f "$CLAUDE_SETTINGS_FILE" ]; then
-    echo "⚠️  Claude settings file already exists"
-    echo "   Location: $CLAUDE_SETTINGS_FILE"
-    echo ""
-    echo "   You have two options:"
-    echo "   1. Backup and replace (recommended for first install)"
-    echo "   2. Manually merge hooks from config/claude_settings.json"
-    echo ""
-    read -p "   Backup and replace? (y/N): " -n 1 -r
-    echo ""
+# 4. Merge hooks into Claude settings
+python3 - "$CLAUDE_SETTINGS" << 'PYTHON_SCRIPT'
+import json
+import sys
+import os
+from copy import deepcopy
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Backup existing settings
-        BACKUP_FILE="$CLAUDE_SETTINGS_FILE.backup.$(date +%Y%m%d_%H%M%S)"
-        echo "💾 Backing up existing settings to:"
-        echo "   $BACKUP_FILE"
-        cp "$CLAUDE_SETTINGS_FILE" "$BACKUP_FILE"
+settings_path = sys.argv[1]
 
-        # Replace PROJECT_DIR placeholder
-        sed "s|{{PROJECT_DIR}}|$SCRIPT_DIR|g" "$SCRIPT_DIR/config/claude_settings.json" > "$CLAUDE_SETTINGS_FILE"
+# The hooks LLM Vault needs
+VAULT_HOOKS = {
+    "SessionStart": [
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.llm-vault/hooks/session_start.py",
+                    "timeout": 5
+                }
+            ]
+        }
+    ],
+    "UserPromptSubmit": [
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.llm-vault/hooks/block_secrets.py",
+                    "timeout": 5
+                }
+            ]
+        }
+    ],
+    "PostToolUse": [
+        {
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.llm-vault/hooks/check_leaks.py",
+                    "timeout": 10
+                }
+            ]
+        }
+    ]
+}
 
-        echo "✓ Settings installed"
-    else
-        echo ""
-        echo "📝 Manual installation required:"
-        echo "   1. Open: $CLAUDE_SETTINGS_FILE"
-        echo "   2. Merge hooks from: $SCRIPT_DIR/config/claude_settings.json"
-        echo "   3. Replace {{PROJECT_DIR}} with: $SCRIPT_DIR"
-        echo ""
-        exit 0
-    fi
-else
-    # No existing settings, install fresh
-    echo "📝 Installing Claude settings..."
+MARKER = "~/.llm-vault/hooks/"
 
-    # Replace PROJECT_DIR placeholder
-    sed "s|{{PROJECT_DIR}}|$SCRIPT_DIR|g" "$SCRIPT_DIR/config/claude_settings.json" > "$CLAUDE_SETTINGS_FILE"
+# Load existing settings
+settings = {}
+if os.path.exists(settings_path):
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        # Back up corrupted file
+        backup = settings_path + ".backup"
+        if os.path.exists(settings_path):
+            os.rename(settings_path, backup)
+            print(f"  ⚠ Backed up corrupted settings to {backup}")
+        settings = {}
 
-    echo "✓ Settings installed"
-fi
+# Remove any existing LLM Vault hooks (clean re-install)
+existing_hooks = settings.get("hooks", {})
+for event_name in list(existing_hooks.keys()):
+    existing_hooks[event_name] = [
+        group for group in existing_hooks[event_name]
+        if not any(
+            MARKER in h.get("command", "")
+            for h in group.get("hooks", [])
+        )
+    ]
+    if not existing_hooks[event_name]:
+        del existing_hooks[event_name]
+
+# Add LLM Vault hooks
+if "hooks" not in settings:
+    settings["hooks"] = {}
+
+for event_name, hook_groups in VAULT_HOOKS.items():
+    if event_name not in settings["hooks"]:
+        settings["hooks"][event_name] = []
+    settings["hooks"][event_name].extend(hook_groups)
+
+# Write settings
+with open(settings_path, 'w') as f:
+    json.dump(settings, f, indent=2)
+
+print(f"  ✓ Hooks added to {settings_path}")
+PYTHON_SCRIPT
+
+# 5. Remove pause flag if it exists (enable protection)
+rm -f "$VAULT_DIR/paused"
 
 echo ""
-echo "================================"
-echo "✓ LLM Vault installed successfully!"
+echo "✅ LLM Vault installed successfully!"
 echo ""
-echo "📚 Next steps:"
+echo "What's active:"
+echo "  • Credential paste blocking (UserPromptSubmit)"
+echo "  • Leak detection in tool output (PostToolUse)"
+echo "  • Secure credential instructions (SessionStart)"
 echo ""
-echo "1. Start the IPC server (in a separate terminal):"
-echo "   python3 $SCRIPT_DIR/lib/ipc_server.py"
-echo ""
-echo "2. Open Claude Code and try it:"
-echo "   - Type: 'Deploy to AWS' or run a command that needs credentials"
-echo "   - Claude will detect missing credentials"
-echo "   - LLM Vault will prompt you securely"
-echo ""
-echo "3. Try pasting a credential directly:"
-echo "   - LLM Vault will block it and show a warning"
-echo ""
-echo "4. Read the full docs:"
-echo "   cat $SCRIPT_DIR/README.md"
-echo ""
-echo "🔒 Your credentials are stored in macOS Keychain"
-echo "   Never in plain text, never in conversation history"
-echo ""
+echo "Quick start:"
+echo "  Store a credential:  security add-generic-password -s llm-vault -a MY_API_KEY -w"
+echo "  List credentials:    python3 ~/.llm-vault/hooks/vault.py list"
+echo "  Pause protection:    touch ~/.llm-vault/paused"
+echo "  Resume protection:   rm ~/.llm-vault/paused"
+echo "  Uninstall:           $(dirname "$0")/uninstall.sh"

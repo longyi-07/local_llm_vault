@@ -4,152 +4,200 @@
 //
 
 import Foundation
-import Security
+
+struct CredentialMetadata: Codable {
+    var createdAt: Date
+    var lastUsedAt: Date?
+    var useCount: Int
+
+    init() {
+        createdAt = Date()
+        lastUsedAt = nil
+        useCount = 0
+    }
+}
 
 struct StoredCredential: Identifiable {
     let id = UUID()
     let keyName: String
-    let context: String?
-    let createdAt: Date
-    let autoInject: Bool
+    let metadata: CredentialMetadata
 }
 
 class KeychainManager {
     static let shared = KeychainManager()
-    private let serviceName = "local-llm-vault"
+    private let serviceName = "llm-vault"
+    private let vaultDir: URL
+    private let registryPath: URL
+    private let metadataDir: URL
 
-    private init() {}
+    private init() {
+        vaultDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".llm-vault")
+        registryPath = vaultDir.appendingPathComponent("keys.json")
+        metadataDir = vaultDir.appendingPathComponent("metadata")
 
-    func storeCredential(keyName: String, value: String, context: String? = nil) {
-        deleteCredential(keyName: keyName)
-
-        guard let valueData = value.data(using: .utf8) else { return }
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: keyName,
-            kSecValueData as String: valueData,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked
-        ]
-
-        let status = SecItemAdd(query as CFDictionary, nil)
-
-        if status == errSecSuccess {
-            print("✓ Stored \(keyName) in Keychain")
-            storeMetadata(keyName: keyName, context: context)
+        try? FileManager.default.createDirectory(at: metadataDir, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: registryPath.path) {
+            try? JSONEncoder().encode([String]()).write(to: registryPath)
         }
+    }
+
+    // MARK: - Keychain (via security CLI for universal access)
+
+    func storeCredential(keyName: String, value: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = [
+            "add-generic-password",
+            "-s", serviceName,
+            "-a", keyName,
+            "-w", value,
+            "-U"
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                registerKey(keyName)
+                if loadMetadata(for: keyName) == nil {
+                    saveMetadata(CredentialMetadata(), for: keyName)
+                }
+                print("✓ Stored \(keyName)")
+            }
+        } catch {
+            print("✗ Failed to store \(keyName): \(error)")
+        }
+    }
+
+    func updateCredential(keyName: String, value: String) {
+        storeCredential(keyName: keyName, value: value)
     }
 
     func getCredential(keyName: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: keyName,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", serviceName, "-a", keyName, "-w"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
 
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        if status == errSecSuccess,
-           let data = result as? Data,
-           let value = String(data: data, encoding: .utf8) {
-            return value
-        }
-
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        } catch {}
         return nil
     }
 
-    func deleteCredential(keyName: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: keyName
-        ]
+    func credentialExists(keyName: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", serviceName, "-a", keyName]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
 
-        SecItemDelete(query as CFDictionary)
-        deleteMetadata(keyName: keyName)
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    func deleteCredential(keyName: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["delete-generic-password", "-s", serviceName, "-a", keyName]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {}
+        deregisterKey(keyName)
+        deleteMetadata(for: keyName)
     }
 
     func listCredentials() -> [StoredCredential] {
-        var credentials: [StoredCredential] = []
-
-        guard let metadataDir = getMetadataDirectory() else { return [] }
-
-        do {
-            let files = try FileManager.default.contentsOfDirectory(at: metadataDir, includingPropertiesForKeys: nil)
-
-            for file in files where file.pathExtension == "json" {
-                let keyName = file.deletingPathExtension().lastPathComponent
-
-                if let metadata = loadMetadata(keyName: keyName) {
-                    let credential = StoredCredential(
-                        keyName: keyName,
-                        context: metadata["context"] as? String,
-                        createdAt: (metadata["created_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date(),
-                        autoInject: metadata["auto_inject"] as? Bool ?? true
-                    )
-                    credentials.append(credential)
-                }
-            }
-        } catch {
-            print("Error listing credentials: \(error)")
-        }
-
-        return credentials.sorted { $0.createdAt > $1.createdAt }
-    }
-
-    private func getMetadataDirectory() -> URL? {
-        guard let homeDir = FileManager.default.homeDirectoryForCurrentUser as URL? else {
-            return nil
-        }
-
-        let metadataDir = homeDir.appendingPathComponent(".local-llm-vault")
-
-        if !FileManager.default.fileExists(atPath: metadataDir.path) {
-            try? FileManager.default.createDirectory(at: metadataDir, withIntermediateDirectories: true)
-        }
-
-        return metadataDir
-    }
-
-    private func storeMetadata(keyName: String, context: String?) {
-        guard let metadataDir = getMetadataDirectory() else { return }
-
-        let metadataFile = metadataDir.appendingPathComponent("\(keyName).json")
-
-        let metadata: [String: Any] = [
-            "key_name": keyName,
-            "context": context ?? "",
-            "created_at": ISO8601DateFormatter().string(from: Date()),
-            "auto_inject": true,
-            "source": "menu_bar_app"
-        ]
-
-        if let data = try? JSONSerialization.data(withJSONObject: metadata, options: .prettyPrinted) {
-            try? data.write(to: metadataFile)
+        let keys = loadRegisteredKeys()
+        return keys.compactMap { keyName in
+            guard credentialExists(keyName: keyName) else { return nil }
+            let meta = loadMetadata(for: keyName) ?? CredentialMetadata()
+            return StoredCredential(keyName: keyName, metadata: meta)
         }
     }
 
-    private func loadMetadata(keyName: String) -> [String: Any]? {
-        guard let metadataDir = getMetadataDirectory() else { return nil }
+    // MARK: - Usage tracking
 
-        let metadataFile = metadataDir.appendingPathComponent("\(keyName).json")
-
-        guard let data = try? Data(contentsOf: metadataFile),
-              let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        return metadata
+    func recordUsage(keyName: String) {
+        var meta = loadMetadata(for: keyName) ?? CredentialMetadata()
+        meta.lastUsedAt = Date()
+        meta.useCount += 1
+        saveMetadata(meta, for: keyName)
     }
 
-    private func deleteMetadata(keyName: String) {
-        guard let metadataDir = getMetadataDirectory() else { return }
+    // MARK: - Metadata (~/.llm-vault/metadata/)
 
-        let metadataFile = metadataDir.appendingPathComponent("\(keyName).json")
-        try? FileManager.default.removeItem(at: metadataFile)
+    private func metadataPath(for keyName: String) -> URL {
+        metadataDir.appendingPathComponent("\(keyName).json")
+    }
+
+    func loadMetadata(for keyName: String) -> CredentialMetadata? {
+        let path = metadataPath(for: keyName)
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(CredentialMetadata.self, from: data)
+    }
+
+    private func saveMetadata(_ metadata: CredentialMetadata, for keyName: String) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .prettyPrinted
+        if let data = try? encoder.encode(metadata) {
+            try? data.write(to: metadataPath(for: keyName))
+        }
+    }
+
+    private func deleteMetadata(for keyName: String) {
+        try? FileManager.default.removeItem(at: metadataPath(for: keyName))
+    }
+
+    // MARK: - Registry (~/.llm-vault/keys.json)
+
+    func loadRegisteredKeys() -> [String] {
+        guard let data = try? Data(contentsOf: registryPath),
+              let keys = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return keys
+    }
+
+    func registerKey(_ name: String) {
+        var keys = loadRegisteredKeys()
+        if !keys.contains(name) {
+            keys.append(name)
+            saveRegisteredKeys(keys)
+        }
+    }
+
+    func deregisterKey(_ name: String) {
+        var keys = loadRegisteredKeys()
+        keys.removeAll { $0 == name }
+        saveRegisteredKeys(keys)
+    }
+
+    private func saveRegisteredKeys(_ keys: [String]) {
+        if let data = try? JSONEncoder().encode(keys.sorted()) {
+            try? data.write(to: registryPath)
+        }
     }
 }

@@ -1,0 +1,72 @@
+#!/bin/bash
+# LLM Vault CLI — thin wrapper around macOS Keychain
+# Usage:
+#   vault get    KEY_NAME       # retrieve value (for inline use)
+#   vault store  KEY_NAME       # store (prompts for value)
+#   vault check  KEY_NAME       # check if key exists (no value shown)
+#   vault list                  # list registered key names
+#   vault remove KEY_NAME       # delete from Keychain + registry
+
+SERVICE="llm-vault"
+REGISTRY="$HOME/.llm-vault/keys.json"
+
+_ensure_registry() {
+    mkdir -p "$HOME/.llm-vault"
+    [ -f "$REGISTRY" ] || echo '[]' > "$REGISTRY"
+}
+
+_register() {
+    _ensure_registry
+    python3 -c "
+import json
+keys = json.load(open('$REGISTRY'))
+if '$1' not in keys:
+    keys.append('$1')
+    json.dump(sorted(keys), open('$REGISTRY','w'))
+"
+}
+
+_deregister() {
+    [ -f "$REGISTRY" ] || return
+    python3 -c "
+import json
+keys = json.load(open('$REGISTRY'))
+keys = [k for k in keys if k != '$1']
+json.dump(sorted(keys), open('$REGISTRY','w'))
+"
+}
+
+case "${1:-}" in
+    get)
+        [ -z "${2:-}" ] && echo "Usage: vault get KEY_NAME" >&2 && exit 1
+        security find-generic-password -s "$SERVICE" -a "$2" -w 2>/dev/null
+        ;;
+    store)
+        [ -z "${2:-}" ] && echo "Usage: vault store KEY_NAME" >&2 && exit 1
+        security add-generic-password -s "$SERVICE" -a "$2" -w -U
+        _register "$2"
+        echo "✓ $2 stored"
+        ;;
+    check)
+        [ -z "${2:-}" ] && echo "Usage: vault check KEY_NAME" >&2 && exit 1
+        if security find-generic-password -s "$SERVICE" -a "$2" >/dev/null 2>&1; then
+            echo "✓ $2 found"
+        else
+            echo "✗ $2 not found" && exit 1
+        fi
+        ;;
+    list)
+        _ensure_registry
+        cat "$REGISTRY"
+        ;;
+    remove)
+        [ -z "${2:-}" ] && echo "Usage: vault remove KEY_NAME" >&2 && exit 1
+        security delete-generic-password -s "$SERVICE" -a "$2" >/dev/null 2>&1
+        _deregister "$2"
+        echo "✓ $2 removed"
+        ;;
+    *)
+        echo "Usage: vault {get|store|check|list|remove} [KEY_NAME]" >&2
+        exit 1
+        ;;
+esac
